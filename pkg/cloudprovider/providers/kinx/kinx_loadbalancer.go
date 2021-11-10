@@ -3,12 +3,15 @@ package kinx
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/attachinterfaces"
+	"github.com/gophercloud/gophercloud/openstack/keymanager/v1/containers"
 	"github.com/gophercloud/gophercloud/openstack/loadbalancer/v2/listeners"
 	"github.com/gophercloud/gophercloud/openstack/loadbalancer/v2/loadbalancers"
 	v2monitors "github.com/gophercloud/gophercloud/openstack/loadbalancer/v2/monitors"
@@ -63,6 +66,7 @@ const (
 	// ServiceAnnotationLoadBalancerEnableHealthMonitor defines whether or not to create health monitor for the load balancer
 	// pool, if not specified, use 'create-monitor' config. The health monitor can be created or deleted dynamically.
 	ServiceAnnotationLoadBalancerEnableHealthMonitor = "loadbalancer.openstack.org/enable-health-monitor"
+	ServiceAnnotationTlsContainerIds                 = "loadbalancer.openstack.org/tls-container-ids"
 )
 
 // LbaasV2 is a LoadBalancer implementation for Neutron LBaaS v2 API
@@ -72,6 +76,12 @@ type LBaasV2 struct {
 
 func (k *Kinx) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
 	klog.V(4).Info("openstack.LoadBalancer() called")
+
+	secret, err := k.NewKeyManagerV1()
+	if err != nil {
+		klog.Errorf("Failed to create an OpenStack KeyManager client: %v", err)
+		return nil, false
+	}
 
 	network, err := k.NewNetworkV2()
 	if err != nil {
@@ -101,7 +111,7 @@ func (k *Kinx) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
 
 	klog.V(1).Info("Claiming to support LoadBalancer")
 
-	return &LBaasV2{LoadBalancer{network, compute, lb, k.lbOpts}}, true
+	return &LBaasV2{LoadBalancer{secret, network, compute, lb, k.lbOpts}}, true
 }
 
 // GetLoadBalancer returns whether the specified load balancer exists and its status
@@ -375,6 +385,33 @@ func (lbaas *LBaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 		klog.V(4).Infof("Ensure an internal loadbalancer service.")
 	}
 
+	var tlsContainerRef string
+	var sniContainerRefs []string
+	tlsContainerString := getStringFromServiceAnnotation(apiService, ServiceAnnotationTlsContainerIds, "")
+	if tlsContainerString != "" {
+		if lbaas.secret == nil {
+			return nil, fmt.Errorf("failed to create a TLS Terminated loadbalancer because openstack keymanager client is not "+
+				"initialized and default-tls-container-ref %q is set", tlsContainerString)
+		}
+
+		tlsContainerIds := regexp.MustCompile("[\\s]*,[\\s]*").Split(tlsContainerString, -1)
+		if len(tlsContainerIds) > 0 {
+			for i := 0; i < len(tlsContainerIds); i++ {
+				container, err := containers.Get(lbaas.secret, tlsContainerIds[i]).Extract()
+				if err != nil {
+					return nil, fmt.Errorf("failed to get tls container %q: %v", tlsContainerIds[i], err)
+				}
+
+				klog.Infof("TLS container %q found", container.ContainerRef)
+
+				tlsContainerIds[i] = container.ContainerRef
+			}
+
+			tlsContainerRef = tlsContainerIds[0]
+			sniContainerRefs = tlsContainerIds[1:]
+		}
+	}
+
 	// TODO Support for ManageSecurityGroups
 
 	affinity := apiService.Spec.SessionAffinity
@@ -440,11 +477,18 @@ func (lbaas *LBaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 		if listener == nil {
 			listenerProtocol := listeners.Protocol(port.Protocol)
 			listenerCreateOpt := listeners.CreateOpts{
-				Name:           cutString(fmt.Sprintf("listener_%d_%s", portIndex, name)),
-				Protocol:       listenerProtocol,
-				ProtocolPort:   int(port.Port),
-				ConnLimit:      &connLimit,
-				LoadbalancerID: loadbalancer.ID,
+				Name:                   cutString(fmt.Sprintf("listener_%d_%s", portIndex, name)),
+				Protocol:               listenerProtocol,
+				ProtocolPort:           int(port.Port),
+				ConnLimit:              &connLimit,
+				LoadbalancerID:         loadbalancer.ID,
+				DefaultTlsContainerRef: tlsContainerRef,
+				SniContainerRefs:       sniContainerRefs,
+			}
+
+			if tlsContainerRef != "" && listenerCreateOpt.Protocol != listeners.ProtocolTerminatedHTTPS {
+				klog.Infof("Forcing to use %q protocol for listener because %q annotation is set", listeners.ProtocolTerminatedHTTPS, ServiceAnnotationTlsContainerIds)
+				listenerCreateOpt.Protocol = listeners.ProtocolTerminatedHTTPS
 			}
 
 			klog.V(4).Infof("Creating listener for port %d using protocol: %s", int(port.Port), listenerProtocol)
@@ -458,6 +502,18 @@ func (lbaas *LBaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 		} else {
 			listenerChanged := false
 			updateOpts := listeners.UpdateOpts{}
+
+			if tlsContainerRef != listener.DefaultTlsContainerRef {
+				klog.Infof("change tls-container-ref (%s) -> (%s)", listener.DefaultTlsContainerRef, tlsContainerRef)
+				updateOpts.DefaultTlsContainerRef = &tlsContainerRef
+				listenerChanged = true
+			}
+
+			if !reflect.DeepEqual(sniContainerRefs, listener.SniContainerRefs) {
+				klog.Infof("change sni-container-ref (%s) -> (%s)", listener.SniContainerRefs, sniContainerRefs)
+				updateOpts.SniContainerRefs = &sniContainerRefs
+				listenerChanged = true
+			}
 
 			if listenerChanged {
 				if err := openstackutil.UpdateListener(lbaas.lb, loadbalancer.ID, listener.ID, updateOpts); err != nil {
@@ -479,6 +535,11 @@ func (lbaas *LBaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 		if pool == nil {
 			// Use the protocol of the listerner
 			poolProto := v2pools.Protocol(listener.Protocol)
+
+			if tlsContainerString != "" {
+				klog.V(4).Infof("Forcing to use %q protocol for pool because annotations %q is set", v2pools.ProtocolHTTP, ServiceAnnotationTlsContainerIds)
+				poolProto = v2pools.ProtocolHTTP
+			}
 
 			lbmethod := v2pools.LBMethod(lbaas.opts.LBMethod)
 			createOpt := v2pools.CreateOpts{
@@ -1032,7 +1093,7 @@ func popMember(members []v2pools.Member, addr string, port int) []v2pools.Member
 // get listener for a port or nil if does not exist
 func getListenerForPort(existingListeners []listeners.Listener, port corev1.ServicePort) *listeners.Listener {
 	for _, l := range existingListeners {
-		if listeners.Protocol(l.Protocol) == toListenersProtocol(port.Protocol) && l.ProtocolPort == int(port.Port) {
+		if l.ProtocolPort == int(port.Port) {
 			return &l
 		}
 	}

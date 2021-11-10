@@ -87,6 +87,7 @@ type NetworkingOpts struct {
 
 // LoadBalancer is used for creating and maintaining load balancers
 type LoadBalancer struct {
+	secret  *gophercloud.ServiceClient
 	network *gophercloud.ServiceClient
 	compute *gophercloud.ServiceClient
 	lb      *gophercloud.ServiceClient
@@ -319,7 +320,7 @@ func ReadConfig(config io.Reader) (Config, error) {
 	cfg.LoadBalancer.MonitorDelay = MyDuration{5 * time.Second}
 	cfg.LoadBalancer.MonitorTimeout = MyDuration{3 * time.Second}
 	cfg.LoadBalancer.MonitorMaxRetries = 1
-	cfg.LoadBalancer.CascadeDelete = true
+	cfg.LoadBalancer.CascadeDelete = false
 
 	err := gcfg.FatalOnly(gcfg.ReadInto(&cfg, config))
 	if err != nil {
